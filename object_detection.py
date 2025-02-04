@@ -20,66 +20,96 @@ def visualize_detections(image, detections):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     cv2.imwrite('debug_detections.jpg', vis_img)
 
-def detect_objects(image, conf_threshold=0.3):
-    """Detect objects in the image using YOLOv5."""
+def detect_red_sphere(image):
+    """Detect red sphere using improved adaptive color thresholding"""
     try:
-        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-        model.conf = conf_threshold
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         
-        # Convert to RGB if needed
-        if len(image.shape) == 3 and image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        # Wider HSV ranges for red detection
+        lower_red1 = np.array([0, 100, 50])    # More permissive lower bounds
+        upper_red1 = np.array([15, 255, 255])  # Wider hue range
+        lower_red2 = np.array([160, 100, 50])  # More permissive lower bounds
+        upper_red2 = np.array([180, 255, 255])
         
-        # Run inference
-        results = model(image)
+        # Create masks with adaptive thresholding
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask = cv2.bitwise_or(mask1, mask2)
         
-        # Initialize detections dictionary
-        detections = {
-            'apple': None
-        }
+        # Enhance mask with adaptive processing
+        blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(blurred, 255, 
+                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 11, 2)
         
-        # Process results with more flexible matching
-        if len(results.xyxy[0]) > 0:
-            best_conf = 0
-            best_detection = None
-            
-            for *xyxy, conf, cls in results.xyxy[0]:
-                label = model.names[int(cls)].lower()
-                logging.info(f"Found {label} with confidence {conf:.2f}")
+        # Noise reduction
+        kernel = np.ones((3,3), np.uint8)  # Smaller kernel
+        mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find and filter contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Store valid contours with their scores
+        valid_contours = []
+        min_area = 50  # Reduced minimum area
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > min_area:
+                perimeter = cv2.arcLength(cnt, True)
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                # Calculate center and average color
+                x, y, w, h = cv2.boundingRect(cnt)
+                center = (x + w//2, y + h//2)
+                mask_roi = np.zeros_like(mask)
+                cv2.drawContours(mask_roi, [cnt], 0, 255, -1)
+                avg_color = cv2.mean(hsv, mask=mask_roi)
                 
-                # Check if label matches any of our target objects
-                for obj_name, possible_labels in OBJECT_MAPPINGS.items():
-                    if label in possible_labels and conf > conf_threshold:
-                        # Update if this is the highest confidence detection
-                        if conf > best_conf:
-                            best_conf = conf
-                            best_detection = (obj_name, [coord.item() for coord in xyxy])
-            
-            # Use the best detection
-            if best_detection:
-                obj_name, coords = best_detection
-                detections[obj_name] = coords
-                logging.info(f"Best match: {obj_name} with confidence {best_conf:.2f}")
+                # Score based on multiple factors
+                score = (circularity * 0.4 +  # Circularity importance
+                        (min(w, h) / max(w, h)) * 0.3 +  # Aspect ratio
+                        (area / (w * h)) * 0.3)  # Fill ratio
+                
+                if score > 0.6:  # More permissive threshold
+                    valid_contours.append((cnt, score, (x, y, w, h)))
         
-        # Visualize results
-        detection_view = image.copy()
-        if any(v is not None for v in detections.values()):
-            for obj_name, bbox in detections.items():
-                if bbox is not None:
-                    cv2.rectangle(detection_view, 
-                                (int(bbox[0]), int(bbox[1])),
-                                (int(bbox[2]), int(bbox[3])),
-                                (0, 255, 0), 2)
-                    cv2.putText(detection_view, 
-                              f"{obj_name}: {best_conf:.2f}",
-                              (int(bbox[0]), int(bbox[1])-10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # Debug visualization
+        debug_view = image.copy()
+        cv2.putText(debug_view, f"Found {len(valid_contours)} candidates", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        if valid_contours:
+            # Sort by score and take the best match
+            best_contour = max(valid_contours, key=lambda x: x[1])
+            cnt, score, (x, y, w, h) = best_contour
             
-        cv2.imshow('Current Detection', detection_view)
+            # Draw detection results
+            cv2.rectangle(debug_view, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.circle(debug_view, (x + w//2, y + h//2), 5, (0, 0, 255), -1)
+            cv2.putText(debug_view, f"Score: {score:.2f}", (x, y-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Show debug views
+            cv2.imshow('Mask', mask)
+            cv2.imshow('Thresholded', thresh)
+            cv2.imshow('Detection Debug', debug_view)
+            cv2.waitKey(1)
+            
+            return {'apple': [float(x), float(y), float(x+w), float(y+h)]}
+        
+        # Show debug views even when no detection
+        cv2.imshow('Mask', mask)
+        cv2.imshow('Thresholded', thresh)
+        cv2.imshow('Detection Debug', debug_view)
         cv2.waitKey(1)
-        
-        return detections
+        return {'apple': None}
         
     except Exception as e:
-        logging.error(f"Detection error: {str(e)}", exc_info=True)
+        logging.error(f"Color detection error: {str(e)}")
         return None
+
+def detect_objects(image, conf_threshold=0.3):
+    """Detect objects in the image using color detection"""
+    return detect_red_sphere(image)

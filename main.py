@@ -22,22 +22,20 @@ JOINT_LIMITS = [
 ]
 
 def get_random_position():
-    """Generate truly random position within robot's reach"""
-    angle = random.uniform(0, 2 * np.pi)
-    radius = random.uniform(0.3, 0.7)
+    """Generate random position in a small square in front of robot"""
     return [
-        radius * np.cos(angle),  # x
-        radius * np.sin(angle),  # y
-        0.05                     # z
+        random.uniform(0.3, 0.7),    # x: 30-70cm in front
+        random.uniform(-0.2, 0.2),   # y: 20cm to either side
+        0.05                         # z: constant height
     ]
 
 def capture_image(camera_position=[0.5, -1.0, 1.0], target_position=[0.5, 0, 0]):
     """Capture image from simulation with configurable camera"""
     width, height = 640, 480
     viewMatrix = p.computeViewMatrix(
-        cameraEyePosition=camera_position,
-        cameraTargetPosition=target_position,
-        cameraUpVector=[0, 0, 1]
+        cameraEyePosition=[0.5, 0, 1.2],  # Directly above workspace
+        cameraTargetPosition=[0.5, 0, 0],  # Looking at center of workspace
+        cameraUpVector=[0, 1, 0]  # Y-axis is up in camera view
     )
     projMatrix = p.computeProjectionMatrixFOV(60, width/height, 0.1, 100.0)
     
@@ -79,9 +77,9 @@ def initialize_simulation():
     return robot, apple
 
 def detect_apple_position():
-    """Detect apple position using YOLO"""
+    """Detect apple position using color detection"""
     image = capture_image(
-        camera_position=[0.5, 0, 1.5],  # Top-down view for better detection
+        camera_position=[0.5, 0, 1.2],  # Top-down view
         target_position=[0.5, 0, 0]
     )
     detections = detect_objects(image)
@@ -96,11 +94,10 @@ def detect_apple_position():
         norm_x = center_x / 640.0
         norm_y = center_y / 480.0
         
-        # Map to world coordinates with adjusted ranges
-        world_x = -0.3 + norm_x * 1.2  # Map [0,1] to [-0.3,0.9]
-        world_y = 0.4 - norm_y * 0.8   # Map [0,1] to [0.4,-0.4]
+        # Map to smaller workspace coordinates
+        world_x = 0.3 + norm_x * 0.4   # Map [0,1] to [0.3,0.7]
+        world_y = -0.2 + norm_y * 0.4   # Map [0,1] to [-0.2,0.2]
         
-        logging.info(f"Detection mapped from ({center_x}, {center_y}) to ({world_x}, {world_y})")
         return [world_x, world_y, 0.05]
     
     return None
@@ -111,10 +108,22 @@ def visualization_thread(stop_event):
     cv2.resizeWindow('Top View', 800, 600)
     
     while not stop_event.is_set():
+        # Use top-down view for visualization
         top_view = capture_image(
-            camera_position=[0.5, 0, 1.5],
+            camera_position=[0.5, 0, 1.2],
             target_position=[0.5, 0, 0]
         )
+        
+        # Draw workspace boundaries
+        img_height, img_width = top_view.shape[:2]
+        pts = np.array([
+            [int(0.3 * img_width), int(0.3 * img_height)],
+            [int(0.7 * img_width), int(0.3 * img_height)],
+            [int(0.7 * img_width), int(0.7 * img_height)],
+            [int(0.3 * img_width), int(0.7 * img_height)]
+        ], np.int32)
+        cv2.polylines(top_view, [pts], True, (0, 255, 0), 2)
+        
         cv2.imshow('Top View', top_view)
         cv2.waitKey(1)
 
@@ -179,17 +188,13 @@ def execute_pick_place(robot, apple_id):
 
     try:
         while True:
-            # Get current apple position from world coordinates
-            apple_pos = p.getBasePositionAndOrientation(apple_id)[0]
-            logging.info(f"Actual apple position: {apple_pos}")
-            
-            # Detect apple using vision
+            # Only use computer vision for detection
             detected_pos = detect_apple_position()
-            logging.info(f"Detected apple position: {detected_pos}")
-            
             if not detected_pos:
-                logging.error("Could not detect apple")
-                return False
+                logging.error("Could not detect apple using computer vision")
+                continue  # Try again instead of falling back
+            
+            logging.info(f"Detected apple position: {detected_pos}")
             
             # Use detected position for movement
             positions = [
@@ -221,19 +226,25 @@ def execute_pick_place(robot, apple_id):
                 # Add small delay between movements
                 time.sleep(0.5)
             
-            # Move to truly random position
+            # After placing, try detection again before moving
+            detected_pos = detect_apple_position()
+            if not detected_pos:
+                logging.error("Failed to detect apple after placement")
+                continue
+                
+            # Move to new random position only after successful detection
             new_pos = get_random_position()
             logging.info(f"Moving apple to new position: {new_pos}")
             p.resetBasePositionAndOrientation(apple_id, new_pos, [0, 0, 0, 1])
             
-            # Let physics settle
+            # Let physics settle and verify detection
             for _ in range(50):
                 p.stepSimulation()
                 time.sleep(1/240)
             
     except Exception as e:
         logging.error(f"Error during pick and place: {e}")
-        if constraint:
+        if 'constraint' in locals() and constraint:
             try:
                 p.removeConstraint(constraint)
             except:
