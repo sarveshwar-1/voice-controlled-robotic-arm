@@ -1,6 +1,0 @@
-pybullet
-torch
-whisper
-opencv-python
-numpy
-ultralytics
